@@ -31,31 +31,17 @@ def _norm_label(text: str) -> str:
 def load_grid_from_xlsx(path: Path) -> Dict[int, Dict[str, str]]:
     """
     Lightweight .xlsx reader that returns a sparse grid:
-    {row_index: {column_letters: string_value}}.
-
-    Avoids third-party dependencies so it can run in constrained environments.
+    {row_index: {column_letters: value}} using openpyxl to handle inline strings.
     """
-    ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    with zipfile.ZipFile(path) as zf:
-        shared_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-        shared_strings = [
-            "".join(node.text or "" for node in si.findall(".//a:t", ns))
-            for si in shared_root.findall("a:si", ns)
-        ]
-
-        sheet_root = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
-
     grid: Dict[int, Dict[str, str]] = defaultdict(dict)
-    for row in sheet_root.findall(".//a:sheetData/a:row", ns):
-        r_idx = int(row.attrib["r"])
-        for c in row.findall("a:c", ns):
-            v = c.find("a:v", ns)
-            raw_val = v.text if v is not None else ""
-            if c.attrib.get("t") == "s" and raw_val:
-                value = shared_strings[int(raw_val)]
-            else:
-                value = raw_val
-            grid[r_idx][_col_letters(c.attrib["r"])] = value
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            col_letters = cell.column_letter
+            grid[cell.row][col_letters] = cell.value
     return grid
 
 
@@ -85,7 +71,7 @@ def _find_row_by_label(
 ) -> Mapping[str, str]:
     target = _norm_label(label)
     for _, cols in sorted(grid.items()):
-        if _norm_label(cols.get(label_col, "")) == target:
+        if _norm_label(str(cols.get(label_col, ""))) == target:
             return cols
     raise KeyError(f"Label '{label}' not found in column {label_col}.")
 
@@ -95,7 +81,7 @@ def _find_row_index_by_label(
 ) -> int:
     target = _norm_label(label)
     for row_idx, cols in sorted(grid.items()):
-        if _norm_label(cols.get(label_col, "")) == target:
+        if _norm_label(str(cols.get(label_col, ""))) == target:
             return row_idx
     raise KeyError(f"Label '{label}' not found in column {label_col}.")
 
@@ -136,6 +122,122 @@ def load_income_statement(path: Path) -> IncomeStatement:
         capex=extract("Capex"),
     )
 
+
+def extract_all_series(path: Path) -> Tuple[List[int], str, Dict[str, Dict[int, Number]]]:
+    """
+    Extract all line-item series keyed by their label in column C.
+    Returns (years list, revenue_label, series_map).
+    """
+    grid = load_grid_from_xlsx(path)
+    _, year_map = _find_year_row(grid)
+    years_sorted = sorted(year_map.values())
+
+    series_map: Dict[str, Dict[int, Number]] = {}
+    for _, cols in sorted(grid.items()):
+        label = cols.get("C")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        label = label.strip()
+        values: Dict[int, Number] = {}
+        for col, year in year_map.items():
+            val = _coerce_float(cols.get(col))
+            if not math.isnan(val):
+                values[year] = val
+        if values:
+            series_map[label] = values
+
+    revenue_label = next((lbl for lbl in series_map if _norm_label(lbl) == _norm_label("Revenue")), None)
+    if not revenue_label:
+        raise ValueError("Could not locate a Revenue line in column C.")
+
+    return years_sorted, revenue_label, series_map
+
+
+def infer_dynamic_assumptions(
+    years: List[int], revenue_label: str, series_map: Mapping[str, Mapping[int, Number]]
+) -> Tuple[Number, Dict[str, Tuple[str, Number]]]:
+    """
+    Infer revenue CAGR and per-line projection strategy.
+    Strategies per line:
+      - ('ratio', pct_of_revenue)
+      - ('cagr', growth_rate)
+      - ('flat', last_value)
+    """
+    revenue = series_map[revenue_label]
+    actual_years = sorted(revenue)
+    if len(actual_years) < 2:
+        raise ValueError("Need at least two revenue periods to infer growth.")
+    first, last = actual_years[0], actual_years[-1]
+    periods = len(actual_years) - 1
+    revenue_cagr = (revenue[last] / revenue[first]) ** (1 / periods) - 1
+
+    strategies: Dict[str, Tuple[str, Number]] = {}
+    for label, series in series_map.items():
+        if label == revenue_label:
+            continue
+        ratios = []
+        vals = []
+        for y in actual_years:
+            rv = revenue.get(y)
+            sv = series.get(y)
+            if rv not in (None, 0, math.nan) and sv not in (None, math.nan):
+                ratios.append(sv / rv)
+                vals.append(sv)
+        if len(ratios) >= 2:
+            strategies[label] = ("ratio", sum(ratios) / len(ratios))
+            continue
+        if len(vals) >= 2 and vals[0] not in (None, 0):
+            growth = (vals[-1] / vals[0]) ** (1 / (len(vals) - 1)) - 1
+            strategies[label] = ("cagr", growth)
+            continue
+        if vals:
+            strategies[label] = ("flat", vals[-1])
+        else:
+            strategies[label] = ("flat", 0.0)
+    return revenue_cagr, strategies
+
+
+def project_dynamic(
+    years: List[int],
+    revenue_label: str,
+    series_map: Mapping[str, Mapping[int, Number]],
+    revenue_cagr: Number,
+    strategies: Mapping[str, Tuple[str, Number]],
+) -> Dict[str, Dict[int, Number]]:
+    """
+    Project revenue and all other lines based on inferred strategies.
+    """
+    revenue = dict(series_map[revenue_label])
+    actual_years = sorted(revenue)
+    forecast_years = [y for y in years if y > actual_years[-1]]
+    for year in forecast_years:
+        prior = revenue[year - 1]
+        revenue[year] = prior * (1 + revenue_cagr)
+
+    projected: Dict[str, Dict[int, Number]] = {revenue_label: revenue}
+
+    for label, series in series_map.items():
+        if label == revenue_label:
+            continue
+        mode, param = strategies.get(label, ("flat", 0.0))
+        full = dict(series)
+        if mode == "ratio":
+            for year in forecast_years:
+                full[year] = revenue[year] * param
+        elif mode == "cagr":
+            # grow from last available value
+            if series:
+                last_year = max(series)
+                last_val = series[last_year]
+                for idx, year in enumerate(forecast_years, start=1):
+                    full[year] = last_val * ((1 + param) ** idx)
+        else:  # flat
+            last_val = next(reversed(sorted(series.values()))) if series else 0.0
+            for year in forecast_years:
+                full[year] = last_val
+        projected[label] = full
+
+    return projected
 
 @dataclass
 class Assumptions:
@@ -279,6 +381,7 @@ def write_template_with_projections(
     assumptions: Assumptions,
     projections: Mapping[str, Mapping[int, Number]],
     note: str | None = None,
+    ratios: Mapping[str, Number] | None = None,
 ) -> None:
     """
     Load the baseline workbook, fill assumptions/margins/projections in-place,
@@ -294,22 +397,18 @@ def write_template_with_projections(
         row_idx = _find_row_index_by_label(grid, label)
         for col, year in year_map.items():
             if year in series:
-                ws[f"{col}{row_idx}"] = series[year]
+                cell = ws[f"{col}{row_idx}"]
+                # Skip merged header cells that cannot be assigned
+                if cell.__class__.__name__ == "MergedCell":
+                    continue
+                cell.value = series[year]
 
     # Core line items
-    for label in [
-        "Revenue",
-        "COGS",
-        "Gross Profit",
-        "SG&A",
-        "R&D",
-        "Other Income",
-        "Capex",
-        "Organic EBITDA",
-        "Total EBITDA",
-    ]:
-        if label in projections:
-            _set_series(label, projections[label])
+    for label, series in projections.items():
+        try:
+            _set_series(label, series)
+        except KeyError:
+            continue
 
     revenue = projections["Revenue"]
     cogs = projections["COGS"]
@@ -385,14 +484,29 @@ def write_template_with_projections(
     # Assumptions block in column Q (values to the right of the labels in column P)
     def _set_assumption(label: str, value: Number) -> None:
         row_idx = _find_row_index_by_label(grid, label, label_col="P")
-        ws[f"Q{row_idx}"] = value
+        cell = ws[f"Q{row_idx}"]
+        if cell.__class__.__name__ != "MergedCell":
+            cell.value = value
 
-    _set_assumption("Revenue growth ", assumptions.revenue_growth_cagr)
-    _set_assumption("COGS", assumptions.cogs_pct)
-    _set_assumption("SG&A", assumptions.sgna_pct)
-    _set_assumption("R&D", assumptions.rnd_pct)
-    _set_assumption("Other Income", assumptions.other_income_pct)
-    _set_assumption("CAPEX", assumptions.capex_pct)
+    # Fill known template assumption slots if present
+    try:
+        _set_assumption("Revenue growth ", assumptions.revenue_growth_cagr)
+        _set_assumption("COGS", assumptions.cogs_pct)
+        _set_assumption("SG&A", assumptions.sgna_pct)
+        _set_assumption("R&D", assumptions.rnd_pct)
+        _set_assumption("Other Income", assumptions.other_income_pct)
+        _set_assumption("CAPEX", assumptions.capex_pct)
+    except Exception:
+        pass
+
+    # Dynamically write any additional ratios to the assumptions block in columns P/Q
+    if ratios:
+        existing_rows = [r for r in grid if _norm_label(str(grid[r].get("P", "")))]
+        start_row = (max(existing_rows) + 1) if existing_rows else 2
+        for label, value in ratios.items():
+            ws[f"P{start_row}"] = label
+            ws[f"Q{start_row}"] = value
+            start_row += 1
 
     # Optional note about source/model in an unused corner
     if note:

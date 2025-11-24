@@ -16,14 +16,7 @@ from typing import Dict, Optional
 
 from openai import OpenAI
 
-from finmod.modeler import (
-    Assumptions,
-    format_table,
-    infer_assumptions,
-    load_income_statement,
-    project_statement,
-    write_template_with_projections,
-)
+from finmod.modeler import Assumptions, extract_all_series, format_table, infer_dynamic_assumptions, project_dynamic, write_template_with_projections
 
 
 def _next_versioned(path: Path) -> Path:
@@ -82,34 +75,30 @@ def _load_dotenv(path: Path) -> None:
             os.environ[key] = val
 
 
-def _build_prompt(income_statement) -> str:
+def _build_prompt(years, series_map) -> str:
     """Create a compact text prompt summarizing historicals and asking for JSON assumptions."""
     lines = []
     lines.append("You are a financial analyst. Given historical P&L lines by year, infer forward assumptions.")
-    lines.append("Return ONLY JSON with keys: revenue_growth_cagr, cogs_pct, sgna_pct, rnd_pct, other_income_pct, capex_pct.")
+    lines.append("Return ONLY JSON with keys: revenue_growth_cagr (decimal), ratios (object mapping line label to decimal pct of revenue), and notes (string).")
     lines.append("All values must be decimals (e.g., 0.12 for 12%).")
     lines.append("Historicals:")
-    years = sorted(income_statement.revenue)
-    for y in years:
-        lines.append(
-            f"{y}: revenue={income_statement.revenue.get(y)}, "
-            f"cogs={income_statement.cogs.get(y)}, "
-            f"sgna={income_statement.sgna.get(y)}, "
-            f"rnd={income_statement.rnd.get(y)}, "
-            f"other_income={income_statement.other_income.get(y)}, "
-            f"capex={income_statement.capex.get(y)}"
-        )
-    lines.append("Assume steady-state growth/margins aligned with recent performance.")
+    for label, series in series_map.items():
+        parts = [f"{y}:{series.get(y)}" for y in years if y in series]
+        if parts:
+            lines.append(f"{label}: " + ", ".join(parts))
+    lines.append(
+        "Assume steady-state growth/margins aligned with recent performance. If a label seems non-operating (e.g., Interest Expense, Tax), still return a pct of revenue as an approximation."
+    )
     return "\n".join(lines)
 
 
-def _call_openai_for_assumptions(income_statement, model: str) -> Assumptions:
+def _call_openai_for_assumptions(years, series_map, model: str) -> Dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set.")
 
     client = OpenAI(api_key=api_key)
-    prompt = _build_prompt(income_statement)
+    prompt = _build_prompt(years, series_map)
     resp = client.chat.completions.create(
         model=model,
         response_format={"type": "json_object"},
@@ -136,27 +125,14 @@ def _call_openai_for_assumptions(income_statement, model: str) -> Assumptions:
             data = json.loads(match.group(0))
         else:
             raise RuntimeError(f"Failed to parse JSON from OpenAI response: {content}") from exc
-
-    return Assumptions(
-        revenue_growth_cagr=float(data["revenue_growth_cagr"]),
-        cogs_pct=float(data["cogs_pct"]),
-        sgna_pct=float(data["sgna_pct"]),
-        rnd_pct=float(data["rnd_pct"]),
-        other_income_pct=float(data["other_income_pct"]),
-        capex_pct=float(data["capex_pct"]),
-    )
+    return data
 
 
-def _render_assumptions(assumptions: Assumptions, source: str, model_name: str) -> str:
-    lines = [
-        f"AI-inferred assumptions (source: {source}, model: {model_name}):",
-        f"- Revenue CAGR: {assumptions.revenue_growth_cagr*100:.2f}%",
-        f"- COGS: {assumptions.cogs_pct*100:.2f}% of revenue",
-        f"- SG&A: {assumptions.sgna_pct*100:.2f}% of revenue",
-        f"- R&D: {assumptions.rnd_pct*100:.2f}% of revenue",
-        f"- Other income: {assumptions.other_income_pct*100:.2f}% of revenue",
-        f"- Capex: {assumptions.capex_pct*100:.2f}% of revenue",
-    ]
+def _render_assumptions(source: str, model_name: str, revenue_cagr: float, ratios: Dict[str, float]) -> str:
+    lines = [f"AI-inferred assumptions (source: {source}, model: {model_name}):"]
+    lines.append(f"- Revenue CAGR: {revenue_cagr*100:.2f}%")
+    for label, pct in list(ratios.items())[:8]:
+        lines.append(f"- {label}: {pct*100:.2f}% of revenue")
     return "\n".join(lines)
 
 
@@ -169,30 +145,59 @@ def run() -> None:
     if not args.file.exists():
         raise SystemExit(f"File not found: {args.file}")
 
-    income_statement = load_income_statement(args.file)
+    years, revenue_label, series_map = extract_all_series(args.file)
+
+    # Deterministic baseline assumptions for all lines
+    det_revenue_cagr, det_strategies = infer_dynamic_assumptions(years, revenue_label, series_map)
 
     # Try OpenAI, fall back to deterministic inference
     source = "openai"
     model_used = args.model
+    ai_ratios: Dict[str, float] = {}
+    note = ""
+    ai_revenue_cagr = det_revenue_cagr
     try:
-        assumptions = _call_openai_for_assumptions(income_statement, args.model)
+        data = _call_openai_for_assumptions(years, series_map, args.model)
+        ai_revenue_cagr = float(data.get("revenue_growth_cagr", det_revenue_cagr))
+        ai_ratios = {k: float(v) for k, v in data.get("ratios", {}).items()}
+        note = data.get("notes", "")
     except Exception as exc:
         source = f"fallback (deterministic) due to error: {exc}"
         model_used = "n/a"
-        assumptions = infer_assumptions(income_statement)
 
-    projected_series = project_statement(income_statement, assumptions)
-    years_to_show = income_statement.years
+    # Merge AI ratios into strategies
+    strategies = dict(det_strategies)
+    for label, pct in ai_ratios.items():
+        strategies[label] = ("ratio", pct)
 
-    print(_render_assumptions(assumptions, source, model_used))
+    projected_series = project_dynamic(years, revenue_label, series_map, ai_revenue_cagr, strategies)
+    years_to_show = years
+
+    print(_render_assumptions(source, model_used, ai_revenue_cagr, ai_ratios or {revenue_label: 1.0}))
     print("\nProjected income statement:\n")
     print(format_table(projected_series, years_to_show))
 
     if args.output_xlsx:
         output_path = _next_versioned(args.output_xlsx)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        note = f"Generated via finmod_ai using model: {model_used}"
-        write_template_with_projections(args.file, output_path, assumptions, projected_series, note=note)
+        note_text = f"Generated via finmod_ai using model: {model_used}. {note}".strip()
+        # Populate template assumption slots with AI ratios when available
+        assumptions_obj = Assumptions(
+            revenue_growth_cagr=ai_revenue_cagr,
+            cogs_pct=ai_ratios.get("COGS", 0.0),
+            sgna_pct=ai_ratios.get("SG&A", 0.0),
+            rnd_pct=ai_ratios.get("R&D", 0.0),
+            other_income_pct=ai_ratios.get("Other Income", 0.0),
+            capex_pct=ai_ratios.get("Capex", ai_ratios.get("CAPEX", 0.0)),
+        )
+        write_template_with_projections(
+            args.file,
+            output_path,
+            assumptions_obj,
+            projected_series,
+            note=note_text,
+            ratios=ai_ratios,
+        )
         print(f"\nSaved projections to {output_path}")
 
 
